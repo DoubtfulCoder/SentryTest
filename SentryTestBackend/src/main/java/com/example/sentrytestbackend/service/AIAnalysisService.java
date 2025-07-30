@@ -13,6 +13,10 @@ import io.sentry.Sentry;
 import java.util.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import java.io.File;
+import java.io.FileWriter;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 @Service
 public class AIAnalysisService {
@@ -20,9 +24,18 @@ public class AIAnalysisService {
     @Autowired
     private RestTemplate restTemplate;
 
-    // Gemini API Configuration
-    private static final String GEMINI_API_KEY = "AIzaSyC7IAPYcawnLgDooqNbNmq9J-CWodNF_Kk";
-    private static final String GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + GEMINI_API_KEY;
+    @Autowired
+    private GitHubCodeFetcher githubCodeFetcher;
+
+    // Gemini API Configuration - now configurable via application.properties
+    @Value("${gemini.api.key}")
+    private String geminiApiKey;
+    
+    @Value("${gemini.api.model}")
+    private String geminiApiModel;
+    
+    @Value("${gemini.api.base-url}")
+    private String geminiBaseUrl;
     
     // Sentry API Configuration (for data fetching)
     @Value("${sentry.api.url:https://noah-3t.sentry.io}")
@@ -43,6 +56,21 @@ public class AIAnalysisService {
     }
     
     // GEMINI DATA CALL GENERATE METHODS //
+
+    // Create a code analysis using github code, recent sentry error, and stacktrace from recent sentry error
+    public List<String> generateGithubCodeAnalysis(StackTraceGenerator stackTraceGenerator){
+        try {
+            String stackTrace = stackTraceGenerator.getMostRecentStackTraceWithGithubLinks();
+            String sentryError = getMostRecentSentryError();
+            String githubCode = githubCodeFetcher.getGithubCode(stackTrace);
+            return callGeminiForGithubCodeAnalysis(stackTrace, sentryError, githubCode);
+
+        } catch (Exception e) {
+            Sentry.captureException(e);
+            return Arrays.asList("AI Analysis unavailable");
+        }  
+    }
+
     // Using Data from readSentryErrorData, create an analysis using patterns
     public String generateAnalysis(){
         try {
@@ -76,6 +104,63 @@ public class AIAnalysisService {
     }
 
     // GEMINI METHODS BELOW //
+
+    // Call Gemini to Recieve x num of error and stack traces, and code snippets for review from those errors
+    public List<List<String>> generateGithubCodeAnalysisForAll(StackTraceGenerator stackTraceGenerator, int maxErrors) {
+        List<List<String>> allAnalyses = new ArrayList<>();
+        try {
+            String allErrorsJson = getRawSentryErrorData();
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode rootNode = mapper.readTree(allErrorsJson);
+            if (rootNode.isArray()) {
+                int errorCount = 0;
+                for (JsonNode event : rootNode) {
+                    if (errorCount > maxErrors){
+                        break;
+                    }
+                    String singleEventArray = "[" + event.toString() + "]";
+                    String stackTrace = stackTraceGenerator.getMostRecentStackTraceWithGithubLinks();
+                    String sentryError = singleEventArray;
+                    String githubCode = githubCodeFetcher.getGithubCode(stackTrace);
+                    List<String> analysis = callGeminiForGithubCodeAnalysis(stackTrace, sentryError, githubCode);
+                    allAnalyses.add(analysis);
+                    errorCount++;
+                }
+            }
+        } catch (Exception e) {
+            Sentry.captureException(e);
+            allAnalyses.add(Arrays.asList("AI Analysis unavailable: " + e.getMessage()));
+        }
+        return allAnalyses;
+    }
+
+    // Call Gemini API for code analysis
+    public List<String> callGeminiForGithubCodeAnalysis(String stackTraceData, String sentryError, String githubCode){
+        try{
+            String prompt = createCodeAnalysisPrompt(stackTraceData, sentryError, githubCode);
+            String geminiResponse = callGeminiAPI(prompt);
+            return parseSuggestionsResponse(geminiResponse);
+        } catch (Exception e){
+            Sentry.captureException(e);
+            return Arrays.asList("Gemini AI Code Review failed: " + e.getMessage());
+        }
+    }
+
+    // Call Gemini API for code analysis with enhanced context (breadcrumbs, request details, error metadata)
+    public List<String> callGeminiForGithubCodeAnalysisWithContext(String stackTraceData, String sentryError, String githubCode, Map<String, Object> enhancedContext){
+        try{
+            String prompt = createEnhancedCodeAnalysisPrompt(stackTraceData, sentryError, githubCode, enhancedContext);
+            
+            // Log the full prompt to JSON file for debugging
+            logPromptToFile(prompt, stackTraceData, sentryError, githubCode, enhancedContext);
+            
+            String geminiResponse = callGeminiAPI(prompt);
+            return parseSuggestionsResponse(geminiResponse);
+        } catch (Exception e){
+            Sentry.captureException(e);
+            return Arrays.asList("Gemini AI Code Review failed: " + e.getMessage());
+        }
+    }
 
     // Call Gemini API for suggestions
     private List<String> callGeminiForSuggestions(String errorData) {
@@ -117,6 +202,114 @@ public class AIAnalysisService {
 
     // GEMINI PROMPT GENERATION METHODS //
 
+    // Using the StackTrace, Error Message, and code from github source code
+    // Create a diagnosis and analysis as to what causes the problem using Gemini
+    private String createCodeAnalysisPrompt(String stackTraceData, String sentryError, String githubCode){
+        return "You are an expert softare engineer analyzing stack trace data and error data from sentry. Please analyze the following lines " +
+        " and try to figure out where the error is coming from and what line." +
+        " Refer to the GitHub links in the stack trace for the exact code location." +
+        " Refer to the Stack Trace, Errors, and Code from Github for context. " +
+        " Please post the code snippet. \n\n" +
+        " Stack Trace:\n" + stackTraceData + "\n\n" +
+        " Sentry Error: \n" + sentryError + "\n\n" +
+        " Code from github: \n" + githubCode + "\n\n";
+    }
+
+    // Create enhanced code analysis prompt with context (breadcrumbs, request details, error metadata)
+    private String createEnhancedCodeAnalysisPrompt(String stackTraceData, String sentryError, String githubCode, Map<String, Object> enhancedContext) {
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You are an expert software engineer analyzing stack trace data and error data from Sentry. Please analyze the following " +
+        "and try to figure out where the error is coming from and what line. " +
+        "Refer to the GitHub links in the stack trace for the exact code location. " +
+        "Use the execution context (breadcrumbs, request details, error metadata) to understand the full picture. " +
+        "Please be specific and actionable in your analysis.\n\n");
+        
+        prompt.append("Stack Trace:\n").append(stackTraceData).append("\n\n");
+        prompt.append("Sentry Error Data:\n").append(sentryError).append("\n\n");
+        prompt.append("GitHub Code:\n").append(githubCode).append("\n\n");
+
+        // Add enhanced context if available
+        if (enhancedContext != null && !enhancedContext.isEmpty()) {
+            prompt.append("=== EXECUTION CONTEXT ===\n\n");
+            
+            // Add breadcrumbs
+            if (enhancedContext.containsKey("breadcrumbs")) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> breadcrumbs = (List<Map<String, Object>>) enhancedContext.get("breadcrumbs");
+                prompt.append("Breadcrumbs (execution trail leading to error):\n");
+                for (Map<String, Object> breadcrumb : breadcrumbs) {
+                    prompt.append("- ");
+                    if (breadcrumb.containsKey("timestamp")) prompt.append(breadcrumb.get("timestamp")).append(" ");
+                    if (breadcrumb.containsKey("level")) prompt.append("[").append(breadcrumb.get("level")).append("] ");
+                    if (breadcrumb.containsKey("category")) prompt.append("(").append(breadcrumb.get("category")).append(") ");
+                    if (breadcrumb.containsKey("message")) prompt.append(breadcrumb.get("message"));
+                    if (breadcrumb.containsKey("data")) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> data = (Map<String, Object>) breadcrumb.get("data");
+                        if (data.containsKey("method") && data.containsKey("url")) {
+                            prompt.append(" - ").append(data.get("method")).append(" ").append(data.get("url"));
+                        }
+                    }
+                    prompt.append("\n");
+                }
+                prompt.append("\n");
+            }
+            
+            // Add request details
+            if (enhancedContext.containsKey("request")) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> request = (Map<String, Object>) enhancedContext.get("request");
+                prompt.append("HTTP Request Details:\n");
+                for (Map.Entry<String, Object> entry : request.entrySet()) {
+                    prompt.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                }
+                prompt.append("\n");
+            }
+            
+            // Add error metadata
+            if (enhancedContext.containsKey("error")) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> error = (Map<String, Object>) enhancedContext.get("error");
+                prompt.append("Error Metadata:\n");
+                for (Map.Entry<String, Object> entry : error.entrySet()) {
+                    prompt.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                }
+                prompt.append("\n");
+            }
+            
+            // Add user context
+            if (enhancedContext.containsKey("user")) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> user = (Map<String, Object>) enhancedContext.get("user");
+                prompt.append("User Context:\n");
+                for (Map.Entry<String, Object> entry : user.entrySet()) {
+                    prompt.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                }
+                prompt.append("\n");
+            }
+            
+            // Add environment context
+            if (enhancedContext.containsKey("environment")) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> environment = (Map<String, String>) enhancedContext.get("environment");
+                prompt.append("Environment:\n");
+                for (Map.Entry<String, String> entry : environment.entrySet()) {
+                    prompt.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                }
+                prompt.append("\n");
+            }
+        }
+
+        prompt.append("Please provide:\n" +
+                     "1. Root cause analysis based on the execution flow\n" +
+                     "2. Specific code location and line causing the issue\n" +
+                     "3. Immediate fix recommendations\n" +
+                     "4. Prevention strategies for similar errors");
+
+        return prompt.toString();
+    }
+
+
     // Create analysis prompt to interpret stack trace data for Gemini
     private String createStackAnalysisPrompt(String stackTraceData) {
         return "You are an expert softare engineer analyzing stack trace data from sentry. Please analyze the following lines " +
@@ -156,6 +349,9 @@ public class AIAnalysisService {
     // Call Gemini API
     private String callGeminiAPI(String prompt) {
         try {
+            // Construct Gemini API URL dynamically
+            String geminiApiUrl = String.format("%s/%s:generateContent?key=%s", 
+                geminiBaseUrl, geminiApiModel, geminiApiKey);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             
@@ -170,7 +366,7 @@ public class AIAnalysisService {
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
             
             ResponseEntity<String> response = restTemplate.exchange(
-                GEMINI_API_URL, HttpMethod.POST, entity, String.class);
+                geminiApiUrl, HttpMethod.POST, entity, String.class);
             
             return response.getBody();
             
@@ -280,7 +476,7 @@ public class AIAnalysisService {
     // DATA RETRIEVE METHODS //    
 
     // Fetches raw JSON data from Sentry's API
-    // Returns it as a readable summary of data
+    // Returns it as a readable summary of all error data
     private String fetchErrorsFromSentryAPI() {
         try {
             // Construct Sentry API URL for events
@@ -299,6 +495,49 @@ public class AIAnalysisService {
             
         } catch (Exception e) {
             throw new RuntimeException("Failed to fetch errors from Sentry API", e);
+        }
+    }
+
+    // Returns raw JSON string from Sentry's API
+    public String getRawSentryErrorData() {
+        try {
+            // Construct Sentry API URL for events
+            String url = String.format("%s/api/0/projects/noah-3t/android/events/?full=true", sentryBaseUrl);
+
+            // Performs GET request on Sentry's API to recieve data
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sentryApiToken);
+            headers.set("Content-Type", "application/json");
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<String> response = restTemplate.exchange(
+                url, HttpMethod.GET, entity, String.class);
+
+            // Return the raw JSON string from Sentry
+            return response.getBody();
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to fetch errors from Sentry API", e);
+        }
+    }
+
+    // Fetches most recent error 
+    // USED FOR STACK TRACES
+    public String getMostRecentSentryError() {
+        try {
+            String allErrorsJson = getRawSentryErrorData(); // gets raw JSON array from Sentry
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode rootNode = mapper.readTree(allErrorsJson);
+            if (rootNode.isArray() && rootNode.size() > 0) {
+                JsonNode mostRecentEvent = rootNode.get(0);
+                String singleEventArray = "[" + mostRecentEvent.toString() + "]";
+                return singleEventArray;
+            }
+            return "No errors found.";
+        } catch (Exception e) {
+            Sentry.captureException(e);
+            return "Failed to fetch most recent error: " + e.getMessage();
         }
     }
     
@@ -354,10 +593,11 @@ public class AIAnalysisService {
         return errorData.toString();
     }
     
-    // Extract error type from Sentry event
+    // Parses a singular Sentry error and determines the type.
     private String extractErrorType(JsonNode event) {
         try {
             // Check exception entries
+            // Looks for errors like "NullPointerException" or "ArithmeticExceptions"
             JsonNode entries = event.path("entries");
             if (entries.isArray()) {
                 for (JsonNode entry : entries) {
@@ -369,41 +609,50 @@ public class AIAnalysisService {
                     }
                 }
             }
-            
-            // Check platform
+            // Check for message tyoe
+            String message = event.path("message").asText();
+            if (!message.isEmpty()){
+                return "Message: " + message;
+            }
+            // Check for level
+            String level = event.path("level").asText();
+            if (!level.isEmpty()){
+                return "Level" + level;
+            }
+            // Check platform (i.e if no exception found return "AndroidError")
             String platform = event.path("platform").asText();
             if ("android".equals(platform)) {
                 return "AndroidError";
             }
-            
         } catch (Exception e) {
-            // Fallback
+            // Fallback as it returns UnknownError if it can't categorize error.
         }
         
         return "UnknownError";
     }
 
-    // Returns raw JSON string from Sentry's API
-    public String getRawSentryErrorData() {
+    // Helper method to log the full prompt and context to a JSON file
+    private void logPromptToFile(String prompt, String stackTraceData, String sentryError, String githubCode, Map<String, Object> enhancedContext) {
         try {
-            // Construct Sentry API URL for events
-            String url = String.format("%s/api/0/projects/noah-3t/android/events/?full=true", sentryBaseUrl);
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));
+            String fileName = "gemini_prompt_log_" + timestamp + ".json";
+            File file = new File(fileName);
+            FileWriter writer = new FileWriter(file);
 
-            // Performs GET request on Sentry's API to recieve data
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("Authorization", "Bearer " + sentryApiToken);
-            headers.set("Content-Type", "application/json");
+            Map<String, Object> logData = new HashMap<>();
+            logData.put("timestamp", timestamp);
+            logData.put("prompt", prompt);
+            logData.put("stackTraceData", stackTraceData);
+            logData.put("sentryError", sentryError);
+            logData.put("githubCode", githubCode);
+            logData.put("enhancedContext", enhancedContext);
 
-            HttpEntity<String> entity = new HttpEntity<>(headers);
-
-            ResponseEntity<String> response = restTemplate.exchange(
-                url, HttpMethod.GET, entity, String.class);
-
-            // Return the raw JSON string from Sentry
-            return response.getBody();
-
+            writer.write(new ObjectMapper().writeValueAsString(logData));
+            writer.close();
+            System.out.println("Prompt and context logged to " + fileName);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to fetch errors from Sentry API", e);
+            Sentry.captureException(e);
+            System.err.println("Failed to log prompt to file: " + e.getMessage());
         }
     }
 }
